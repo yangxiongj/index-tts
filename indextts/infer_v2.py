@@ -9,6 +9,7 @@ import librosa
 import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
+from torch.backends.cuda import sdp_kernel
 
 import warnings
 
@@ -34,6 +35,10 @@ import safetensors
 from transformers import SeamlessM4TFeatureExtractor
 import random
 import torch.nn.functional as F
+
+torch.set_float32_matmul_precision("high")
+sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True)
+
 
 class IndexTTS2:
     def __init__(
@@ -319,7 +324,7 @@ class IndexTTS2:
                 print(f"Audio too long ({audio.shape[1]} samples), truncating to {max_audio_samples} samples")
             audio = audio[:, :max_audio_samples]
         return audio, sr
-    
+
     def normalize_emo_vec(self, emo_vector, apply_bias=True):
         # apply biased emotion factors for better user experience,
         # by de-emphasizing emotions that can cause strange results
@@ -771,12 +776,20 @@ class QwenEmotion:
         )
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
 
-        # conduct text completion
-        generated_ids = self.model.generate(
-            **model_inputs,
-            max_new_tokens=32768,
-            pad_token_id=self.tokenizer.eos_token_id
-        )
+        # conduct text completion (optimized)
+        input_len = model_inputs["input_ids"].shape[1]
+        max_len = min(input_len + 2048, 32768)
+
+        with torch.inference_mode(), torch.cuda.amp.autocast(device_type="cuda", dtype=torch.float16):
+            generated_ids = self.model.generate(
+                **model_inputs,
+                max_new_tokens=max_len,
+                pad_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,
+                do_sample=False,
+                attn_implementation="sdpa"
+            )
+
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
 
         # parsing thinking content
